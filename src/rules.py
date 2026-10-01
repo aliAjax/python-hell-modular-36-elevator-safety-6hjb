@@ -101,15 +101,85 @@ def _validate_permit(data, lookup):
         raise ValidationError("invalid permit purpose")
 
 
+def permit_blockers(equipment, lookup):
+    """Structured reasons why return-to-service is blocked for equipment.
+
+    Inspections, open remediation and unfinished rescue work are reported
+    together so a recovery screen can show every blocker instead of the first
+    failure only.
+    """
+    blockers = []
+    equipment_id = equipment["id"]
+    inspections = [
+        i for i in _all(lookup, "inspection")
+        if i["data"].get("equipment_id") == equipment_id
+    ]
+    passed = [i for i in inspections if i["status"] == "passed"]
+    if not passed:
+        failed = [i for i in inspections if i["status"] == "failed"]
+        if failed:
+            latest = failed[0]
+            blockers.append({
+                "type": "inspection",
+                "reason": "latest inspection failed",
+                "inspection_id": latest["id"],
+            })
+        else:
+            blockers.append({
+                "type": "inspection",
+                "reason": "no passed inspection on record",
+            })
+    open_remediation = [
+        r for r in _all(lookup, "remediation")
+        if r["data"].get("equipment_id") == equipment_id and r["status"] != "closed"
+    ]
+    for item in open_remediation:
+        blockers.append({
+            "type": "remediation",
+            "reason": "remediation is not closed",
+            "remediation_id": item["id"],
+            "issue": item["data"].get("issue"),
+            "status": item["status"],
+        })
+    alarms = [
+        a for a in _all(lookup, "alarm")
+        if a["data"].get("equipment_id") == equipment_id
+        and a["status"] not in ("closed", "false_alarm")
+    ]
+    for alarm in alarms:
+        active_jobs = [
+            j for j in _all(lookup, "rescue_job")
+            if j["data"].get("alarm_id") == alarm["id"]
+            and j["status"] not in ("completed", "aborted")
+        ]
+        for job in active_jobs:
+            blockers.append({
+                "type": "rescue",
+                "reason": "rescue job is still in progress",
+                "rescue_job_id": job["id"],
+                "alarm_id": alarm["id"],
+                "team": job["data"].get("team"),
+                "status": job["status"],
+            })
+        blockers.append({
+            "type": "rescue",
+            "reason": "alarm is not closed",
+            "alarm_id": alarm["id"],
+            "status": alarm["status"],
+        })
+    return blockers
+
+
 def _grant_permit(actor, entity, data, lookup):
     equipment = _find_one(lookup, "equipment", "id", entity["data"].get("equipment_id"))
     if not equipment or equipment["status"] not in ("in_service", "suspended"):
         raise ConflictError("permit can only be granted for a serviceable equipment")
-    inspections = [i for i in _all(lookup, "inspection") if i["data"].get("equipment_id") == equipment["id"] and i["status"] == "passed"]
-    if not inspections:
-        raise ConflictError("permit requires a passed inspection")
-    if [r for r in _all(lookup, "remediation") if r["data"].get("equipment_id") == equipment["id"] and r["status"] != "closed"]:
-        raise ConflictError("permit blocked by open remediation")
+    blockers = permit_blockers(equipment, lookup)
+    if blockers:
+        raise ConflictError(
+            "permit blocked: " + "; ".join(b["reason"] for b in blockers),
+            blockers=blockers,
+        )
     return {"granted_by": actor.user_id, "granted_at": datetime.utcnow().isoformat(timespec="seconds") + "Z"}
 
 
@@ -172,7 +242,10 @@ class RuleEngine:
         "permit": {
             "request_review": (("blocked",), "pending_review"),
             "grant": (("pending_review",), "granted"),
-            "revoke": (("granted", "pending_review"), "revoked"),
+            # A permit can be invalidated from every non-terminal state; the
+            # equipment status change drives this automatically.
+            "revoke": (("blocked", "granted", "pending_review"), "revoked"),
+            "complete": (("granted",), "completed"),
             "expire": (("granted",), "expired"),
         },
     }
@@ -198,14 +271,17 @@ class RuleEngine:
         "equipment": ("admin", "inspector"),
         "inspection": ("admin", "inspector"),
         "maintenance": ("admin", "maintenance"),
-        "alarm": ("admin", "dispatcher", "inspector"),
-        "rescue_job": ("admin", "dispatcher"),
+        # Maintenance crews register entrapment alarms and dispatch rescue
+        # jobs locally while the garage is offline.
+        "alarm": ("admin", "dispatcher", "inspector", "maintenance"),
+        "rescue_job": ("admin", "dispatcher", "maintenance"),
         "remediation": ("admin", "inspector", "maintenance"),
         "permit": ("admin", "inspector"),
     }
     ROLE_ACTIONS = {
-        "suspend": ("admin", "inspector"),
-        "out_of_service": ("admin", "inspector"),
+        # Maintenance crews physically take equipment out of service on site.
+        "suspend": ("admin", "inspector", "maintenance"),
+        "out_of_service": ("admin", "inspector", "maintenance"),
         "return_to_service": ("admin", "inspector"),
         "pass": ("admin", "inspector"),
         "fail": ("admin", "inspector"),
@@ -216,7 +292,7 @@ class RuleEngine:
         "mark_false": ("admin", "dispatcher", "inspector"),
         "resolve": ("admin", "dispatcher"),
         "close": ("admin", "dispatcher", "inspector"),
-        "arrive": ("admin", "dispatcher"),
+        "arrive": ("admin", "dispatcher", "maintenance"),
         "abort": ("admin", "dispatcher"),
         "submit_evidence": ("admin", "maintenance", "inspector"),
         "verify": ("admin", "inspector"),
@@ -225,6 +301,12 @@ class RuleEngine:
         "grant": ("admin", "inspector"),
         "revoke": ("admin", "inspector"),
         "expire": ("admin", "inspector"),
+    }
+    # "complete" means different things per kind; explicit kind-scoped rules
+    # take precedence over the action-level defaults above.
+    ROLE_ACTIONS_KIND = {
+        ("rescue_job", "complete"): ("admin", "dispatcher", "maintenance"),
+        ("permit", "complete"): ("admin", "inspector"),
     }
     CUSTOM_CREATE = {
         "equipment": lambda a, d, l: _validate_equipment(d, l),
@@ -269,7 +351,9 @@ class RuleEngine:
         allowed_statuses, next_status = transition
         if entity["status"] not in allowed_statuses:
             raise InvalidTransition("cannot %s from status %s" % (action, entity["status"]))
-        allowed = self.ROLE_ACTIONS.get((kind, action), self.ROLE_ACTIONS.get(action, ("admin",)))
+        allowed = self.ROLE_ACTIONS_KIND.get((kind, action))
+        if allowed is None:
+            allowed = self.ROLE_ACTIONS.get((kind, action), self.ROLE_ACTIONS.get(action, ("admin",)))
         _ensure_role(actor, allowed)
         _require(data, self.ACTION_REQUIRED.get((kind, action), ()))
         custom = self.CUSTOM_TRANSITIONS.get((kind, action))

@@ -20,7 +20,18 @@ class NotFoundError(DomainError):
 
 
 class ConflictError(DomainError):
-    """A version or uniqueness constraint was violated."""
+    """A version or uniqueness constraint was violated.
+
+    ``current`` carries the conflicting entity's current revision, ``related``
+    carries related state (for example the rescue team that won the dispatch),
+    and ``blockers`` carries structured reasons when an action is blocked.
+    """
+
+    def __init__(self, message, current=None, related=None, blockers=None):
+        super().__init__(message)
+        self.current = current
+        self.related = related
+        self.blockers = blockers
 
 
 class InvalidTransition(DomainError):

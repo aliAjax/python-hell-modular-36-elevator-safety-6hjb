@@ -70,7 +70,14 @@ def create_handler(service, rules, static_dir):
                 status = 400
             else:
                 status = 500
-            self._send(status, {"error": str(exc), "type": type(exc).__name__})
+            payload = {"error": str(exc), "type": type(exc).__name__}
+            # The losing dispatcher must see the conflicting task at its
+            # current revision and the rescue team that won.
+            for field in ("current", "related", "blockers"):
+                value = getattr(exc, field, None)
+                if value:
+                    payload[field] = value
+            self._send(status, payload)
 
         def do_GET(self):
             try:
@@ -84,6 +91,14 @@ def create_handler(service, rules, static_dir):
                         return self._send_html(200, handle.read())
                 if parts == ["api", "audit"]:
                     return self._send(200, {"items": service.audit_log()})
+                if parts == ["api", "recovery"]:
+                    query = parse_qs(parsed.query)
+                    equipment_id = query.get("equipment_id", [None])[0]
+                    return self._send(200, service.recovery_report(equipment_id))
+                if len(parts) == 3 and parts[:2] == ["api", "sync"]:
+                    return self._send(200, service.get_sync_batch(parts[2]))
+                if len(parts) == 4 and parts[:2] == ["api", "sync"] and parts[3] == "resume":
+                    return self._send(200, service.resume_batch(parts[2]))
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     return self._send(200, service.get(parts[2]))
                 if len(parts) >= 2 and parts[0] == "api" and parts[1] != "entities":
@@ -101,9 +116,13 @@ def create_handler(service, rules, static_dir):
                 parsed = urlparse(self.path)
                 parts = [part for part in parsed.path.split("/") if part]
                 actor = self._actor()
+                if len(parts) == 4 and parts[:2] == ["api", "sync"] and parts[3] == "resume":
+                    self._body()
+                    return self._send(200, service.resume_batch(parts[2]))
                 if parts == ["api", "offline-records"]:
                     body = self._body()
-                    return self._send(200, {"items": service.merge_offline(actor, body.get("records", []))})
+                    batch = service.merge_offline(actor, body.get("records", []))
+                    return self._send(200, batch)
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     body = self._body()
                     action = body.pop("action", None)
