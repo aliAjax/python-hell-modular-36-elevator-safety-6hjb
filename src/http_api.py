@@ -70,7 +70,11 @@ def create_handler(service, rules, static_dir):
                 status = 400
             else:
                 status = 500
-            self._send(status, {"error": str(exc), "type": type(exc).__name__})
+            payload = {"error": str(exc), "type": type(exc).__name__}
+            details = getattr(exc, "details", None)
+            if details:
+                payload["details"] = details
+            self._send(status, payload)
 
         def do_GET(self):
             try:
@@ -84,6 +88,10 @@ def create_handler(service, rules, static_dir):
                         return self._send_html(200, handle.read())
                 if parts == ["api", "audit"]:
                     return self._send(200, {"items": service.audit_log()})
+                if parts == ["api", "offline-batches"]:
+                    return self._send(200, {"items": service.merge_batches()})
+                if len(parts) == 3 and parts[:2] == ["api", "offline-batches"]:
+                    return self._send(200, service.merge_batch(parts[2]))
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     return self._send(200, service.get(parts[2]))
                 if len(parts) >= 2 and parts[0] == "api" and parts[1] != "entities":
@@ -103,7 +111,9 @@ def create_handler(service, rules, static_dir):
                 actor = self._actor()
                 if parts == ["api", "offline-records"]:
                     body = self._body()
-                    return self._send(200, {"items": service.merge_offline(actor, body.get("records", []))})
+                    return self._send(200, service.merge_offline(actor, body.get("records", [])))
+                if len(parts) == 4 and parts[:2] == ["api", "offline-batches"] and parts[3] == "resume":
+                    return self._send(200, service.resume_merge_batch(actor, parts[2]))
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     body = self._body()
                     action = body.pop("action", None)

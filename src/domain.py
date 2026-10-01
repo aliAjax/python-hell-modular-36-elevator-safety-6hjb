@@ -20,7 +20,16 @@ class NotFoundError(DomainError):
 
 
 class ConflictError(DomainError):
-    """A version or uniqueness constraint was violated."""
+    """A version or uniqueness constraint was violated.
+
+    ``details`` carries structured context about the conflict (e.g. the
+    conflicting rescue task and its latest team, or the list of blocking
+    reasons) so callers can react without re-querying.
+    """
+
+    def __init__(self, message, details=None):
+        super().__init__(message)
+        self.details = details or {}
 
 
 class InvalidTransition(DomainError):

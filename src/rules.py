@@ -1,6 +1,10 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
 
 from .domain import ConflictError, InvalidTransition, PermissionDenied, ValidationError
+
+
+def _utcnow():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds") + "Z"
 
 
 def _require(data, fields):
@@ -22,6 +26,19 @@ def _all(lookup, kind):
 def _find_one(lookup, kind, field, value):
     rows = lookup(kind, field, value) or [] if lookup else []
     return rows[0] if rows else None
+
+
+def _summary(entity):
+    """Compact snapshot of an entity for conflict details."""
+    if not entity:
+        return None
+    return {
+        "id": entity["id"],
+        "kind": entity["kind"],
+        "status": entity["status"],
+        "version": entity["version"],
+        "data": entity.get("data", {}),
+    }
 
 
 def _positive(value, field):
@@ -80,9 +97,15 @@ def _validate_rescue(data, lookup):
     if not alarm or alarm["status"] == "closed":
         raise ValidationError("rescue_job requires an active alarm")
     key = data.get("dedupe_key")
-    for job in _all(lookup, "rescue_job"):
-        if job["data"].get("dedupe_key") == key and job["status"] not in ("completed", "aborted"):
-            raise ConflictError("active rescue job already exists for dedupe_key")
+    existing = [
+        job for job in _all(lookup, "rescue_job")
+        if job["data"].get("dedupe_key") == key and job["status"] not in ("completed", "aborted")
+    ]
+    if existing:
+        raise ConflictError(
+            "active rescue job already exists for dedupe_key: " + str(key),
+            details={"conflicting": [_summary(job) for job in existing]},
+        )
 
 
 def _validate_remediation(data, lookup):
@@ -101,16 +124,103 @@ def _validate_permit(data, lookup):
         raise ValidationError("invalid permit purpose")
 
 
+def _rescue_blockers(lookup, equipment_id):
+    """Return human-readable blockers from active alarms / unfinished rescue jobs."""
+    alarms = [
+        a for a in _all(lookup, "alarm")
+        if a["data"].get("equipment_id") == equipment_id
+    ]
+    active = [a for a in alarms if a["status"] not in ("closed", "false_alarm")]
+    alarm_ids = {a["id"] for a in alarms}
+    open_jobs = [
+        j for j in _all(lookup, "rescue_job")
+        if j["data"].get("alarm_id") in alarm_ids and j["status"] not in ("completed", "aborted")
+    ]
+    blockers = []
+    if active:
+        blockers.append("active alarm not resolved: " + ", ".join(a["id"] for a in active))
+    if open_jobs:
+        def _desc(j):
+            team = j["data"].get("team")
+            return j["id"] + ("(team=" + str(team) + ")" if team else "")
+        blockers.append("rescue job not complete: " + ", ".join(_desc(j) for j in open_jobs))
+    return blockers
+
+
+def _inspection_blockers(lookup, equipment_id):
+    inspections = [
+        i for i in _all(lookup, "inspection")
+        if i["data"].get("equipment_id") == equipment_id
+    ]
+    if [i for i in inspections if i["status"] == "passed"]:
+        return []
+    return ["no passed inspection (检验未通过)"]
+
+
+def _remediation_blockers(lookup, equipment_id):
+    open_items = [
+        r for r in _all(lookup, "remediation")
+        if r["data"].get("equipment_id") == equipment_id and r["status"] != "closed"
+    ]
+    if not open_items:
+        return []
+    return ["open remediation (整改未关闭): " + ", ".join(r["id"] for r in open_items)]
+
+
 def _grant_permit(actor, entity, data, lookup):
     equipment = _find_one(lookup, "equipment", "id", entity["data"].get("equipment_id"))
+    blockers = []
     if not equipment or equipment["status"] not in ("in_service", "suspended"):
-        raise ConflictError("permit can only be granted for a serviceable equipment")
-    inspections = [i for i in _all(lookup, "inspection") if i["data"].get("equipment_id") == equipment["id"] and i["status"] == "passed"]
-    if not inspections:
-        raise ConflictError("permit requires a passed inspection")
-    if [r for r in _all(lookup, "remediation") if r["data"].get("equipment_id") == equipment["id"] and r["status"] != "closed"]:
-        raise ConflictError("permit blocked by open remediation")
-    return {"granted_by": actor.user_id, "granted_at": datetime.utcnow().isoformat(timespec="seconds") + "Z"}
+        blockers.append("equipment not in a serviceable state")
+    else:
+        blockers.extend(_inspection_blockers(lookup, equipment["id"]))
+        blockers.extend(_remediation_blockers(lookup, equipment["id"]))
+        blockers.extend(_rescue_blockers(lookup, equipment["id"]))
+    if blockers:
+        raise ConflictError(
+            "permit cannot be granted: " + "; ".join(blockers),
+            details={"blockers": blockers},
+        )
+    return {"granted_by": actor.user_id, "granted_at": _utcnow()}
+
+
+def _return_to_service(actor, entity, data, lookup):
+    blockers = []
+    blockers.extend(_inspection_blockers(lookup, entity["id"]))
+    blockers.extend(_remediation_blockers(lookup, entity["id"]))
+    blockers.extend(_rescue_blockers(lookup, entity["id"]))
+    if blockers:
+        raise ConflictError(
+            "cannot return to service: " + "; ".join(blockers),
+            details={"blockers": blockers},
+        )
+    return {"returned_by": actor.user_id, "returned_at": _utcnow()}
+
+
+def _dispatch_alarm(actor, entity, data, lookup):
+    """Full transition handler for alarm.dispatch.
+
+    Two dispatchers racing on the same alarm must both see the conflicting
+    rescue task and its latest team, so an already-dispatched alarm or an
+    alarm with active rescue jobs raises a ConflictError (with details)
+    rather than a bare invalid-transition error.
+    """
+    _ensure_role(actor, RuleEngine.ROLE_ACTIONS.get(("alarm", "dispatch"), ("admin", "dispatcher")))
+    jobs = [
+        j for j in _all(lookup, "rescue_job")
+        if j["data"].get("alarm_id") == entity["id"] and j["status"] not in ("completed", "aborted")
+    ]
+    if entity["status"] != "received":
+        raise ConflictError(
+            "alarm is already %s" % entity["status"],
+            details={"alarm": _summary(entity), "rescue_jobs": [_summary(j) for j in jobs]},
+        )
+    if jobs:
+        raise ConflictError(
+            "alarm already has active rescue jobs",
+            details={"alarm": _summary(entity), "rescue_jobs": [_summary(j) for j in jobs]},
+        )
+    return "dispatched", {"dispatched_by": actor.user_id, "dispatched_at": _utcnow()}
 
 
 def _verify_remediation(actor, entity, data, lookup):
@@ -122,7 +232,11 @@ def _verify_remediation(actor, entity, data, lookup):
 def _complete_rescue(actor, entity, data, lookup):
     jobs = [j for j in _all(lookup, "rescue_job") if j["data"].get("alarm_id") == entity["id"]]
     if not jobs or any(job["status"] not in ("completed", "aborted") for job in jobs):
-        raise ConflictError("alarm cannot close before rescue jobs are complete")
+        open_jobs = [j for j in jobs if j["status"] not in ("completed", "aborted")]
+        raise ConflictError(
+            "alarm cannot close before rescue jobs are complete",
+            details={"rescue_jobs": [_summary(j) for j in open_jobs]},
+        )
     return {"resolved_by": actor.user_id}
 
 
@@ -239,10 +353,28 @@ class RuleEngine:
         ("permit", "grant"): _grant_permit,
         ("remediation", "verify"): _verify_remediation,
         ("alarm", "close"): _complete_rescue,
+        ("equipment", "return_to_service"): _return_to_service,
+    }
+    # Full handlers own the whole transition (status check included) so they
+    # can raise conflict errors that carry the conflicting task/team.
+    FULL_TRANSITIONS = {
+        ("alarm", "dispatch"): _dispatch_alarm,
+    }
+    # Target status for full handlers (used for idempotent merge replay).
+    NEXT_STATUS = {
+        ("alarm", "dispatch"): "dispatched",
     }
 
     def normalize_kind(self, kind):
         return self.ALIASES.get(kind, kind)
+
+    def next_status(self, kind, action):
+        """Target status of an action, or None if unknown."""
+        kind = self.normalize_kind(kind)
+        transition = self.TRANSITIONS.get(kind, {}).get(action)
+        if transition:
+            return transition[1]
+        return self.NEXT_STATUS.get((kind, action))
 
     def initial_status(self, kind, data=None):
         kind = self.normalize_kind(kind)
@@ -263,6 +395,9 @@ class RuleEngine:
 
     def validate_transition(self, actor, entity, action, data, lookup=None):
         kind = self.normalize_kind(entity["kind"])
+        full = self.FULL_TRANSITIONS.get((kind, action))
+        if full:
+            return full(actor, entity, data, lookup)
         transition = self.TRANSITIONS.get(kind, {}).get(action)
         if not transition:
             raise InvalidTransition("unknown action %s for %s" % (action, kind))

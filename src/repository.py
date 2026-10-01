@@ -54,6 +54,37 @@ class SQLiteRepository:
                     created_at TEXT NOT NULL,
                     PRIMARY KEY(actor_id, idem_key)
                 );
+                CREATE TABLE IF NOT EXISTS merge_batches (
+                    id TEXT PRIMARY KEY,
+                    source_id TEXT NOT NULL,
+                    actor_id TEXT NOT NULL,
+                    actor_role TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    total INTEGER NOT NULL,
+                    done INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS merge_records (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    batch_id TEXT NOT NULL,
+                    seq INTEGER NOT NULL,
+                    source_id TEXT NOT NULL,
+                    record_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    op TEXT NOT NULL,
+                    data TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    entity_id TEXT,
+                    error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(batch_id, seq)
+                );
+                CREATE INDEX IF NOT EXISTS idx_merge_records_batch
+                    ON merge_records(batch_id, seq);
+                CREATE INDEX IF NOT EXISTS idx_merge_batches_status
+                    ON merge_batches(status);
             """)
 
     @staticmethod
@@ -198,6 +229,116 @@ class SQLiteRepository:
                 "VALUES (?, ?, ?, ?)",
                 (actor_id, idem_key, entity_id, utcnow()),
             )
+
+    # ------------------------------------------------------------------
+    # Offline merge batches
+    # ------------------------------------------------------------------
+
+    def create_merge_batch(self, batch_id, source_id, actor_id, actor_role, total):
+        now = utcnow()
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO merge_batches(id, source_id, actor_id, actor_role, status, total, done, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, 'processing', ?, 0, ?, ?)",
+                (batch_id, source_id, actor_id, actor_role, total, now, now),
+            )
+        return self.get_merge_batch(batch_id)
+
+    def add_merge_record(self, batch_id, seq, source_id, record_id, kind, op, data):
+        now = utcnow()
+        payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO merge_records(batch_id, seq, source_id, record_id, kind, op, data, status, entity_id, error, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, ?, ?)",
+                (batch_id, seq, source_id, record_id, kind, op, payload, now, now),
+            )
+
+    def update_merge_record(self, batch_id, seq, status, entity_id=None, error=None):
+        now = utcnow()
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE merge_records SET status = ?, entity_id = COALESCE(?, entity_id), "
+                "error = ?, updated_at = ? WHERE batch_id = ? AND seq = ?",
+                (status, entity_id, error, now, batch_id, seq),
+            )
+
+    def touch_merge_batch(self, batch_id, status, done):
+        now = utcnow()
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE merge_batches SET status = ?, done = ?, updated_at = ? WHERE id = ?",
+                (status, done, now, batch_id),
+            )
+
+    def get_merge_batch(self, batch_id):
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM merge_batches WHERE id = ?", (batch_id,)
+            ).fetchone()
+        return self._batch_from_row(row) if row else None
+
+    def list_merge_batches(self, status=None):
+        with self._connect() as connection:
+            if status:
+                rows = connection.execute(
+                    "SELECT * FROM merge_batches WHERE status = ? ORDER BY created_at",
+                    (status,),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT * FROM merge_batches ORDER BY created_at"
+                ).fetchall()
+        return [self._batch_from_row(row) for row in rows]
+
+    def list_merge_records(self, batch_id):
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM merge_records WHERE batch_id = ? ORDER BY seq",
+                (batch_id,),
+            ).fetchall()
+        return [self._record_from_row(row) for row in rows]
+
+    def find_merge_record(self, source_id, record_id):
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM merge_records WHERE source_id = ? AND record_id = ? "
+                "AND status = 'done' ORDER BY id DESC LIMIT 1",
+                (source_id, record_id),
+            ).fetchone()
+        return self._record_from_row(row) if row else None
+
+    @staticmethod
+    def _batch_from_row(row):
+        return {
+            "id": row["id"],
+            "source_id": row["source_id"],
+            "actor_id": row["actor_id"],
+            "actor_role": row["actor_role"],
+            "status": row["status"],
+            "total": int(row["total"]),
+            "done": int(row["done"]),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    @staticmethod
+    def _record_from_row(row):
+        return {
+            "id": row["id"],
+            "batch_id": row["batch_id"],
+            "seq": int(row["seq"]),
+            "source_id": row["source_id"],
+            "record_id": row["record_id"],
+            "kind": row["kind"],
+            "op": row["op"],
+            "data": json.loads(row["data"]),
+            "status": row["status"],
+            "entity_id": row["entity_id"],
+            "error": row["error"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
 
     def ping(self):
         with self._connect() as connection:

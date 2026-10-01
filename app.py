@@ -1,5 +1,6 @@
 import argparse
 import signal
+import threading
 from pathlib import Path
 
 from src.http_api import create_server
@@ -20,6 +21,15 @@ def main(argv=None):
     service = DomainService(repository, rules)
     static_dir = Path(__file__).resolve().parent / "static"
     server = create_server(args.host, args.port, service, rules, str(static_dir))
+
+    # Resume offline merge batches interrupted by a previous crash/restart.
+    def _resume():
+        try:
+            service.resume_incomplete_batches()
+        except Exception:
+            pass
+
+    threading.Thread(target=_resume, daemon=True).start()
 
     def stop(signum, frame):
         raise KeyboardInterrupt
